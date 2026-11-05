@@ -1,0 +1,12 @@
+# Slack チャンネル名 = 使うプロファイル（profiles/<名前>/）
+# 作業場を分けるチャンネルは表で書く: "チャンネル名" = { profile = "名前", work_dir = "~/…", git_sync = true }
+#   work_dir  claude を動かすディレクトリ（書かなければ runtime/workspace）。ガードのあるプロファイルでは、このリポジトリの外を指定する
+#   git_sync  work_dir の git リポジトリを、依頼の前に pull し、終わったら commit・push する。commit メッセージに依頼の 1 行目が入るので、private のリポジトリに使う
+#   model     このチャンネルの既定のモデル（sonnet か opus。書かなければ sonnet。メッセージに opus と書けば、そのメッセージは opus）
+#   effort    claude --effort の値（low・medium・high・xhigh・max。書かなければ medium）
+# ここに書いていないチャンネルは、共通の設定（config/claude-settings.json）だけで動く
+"research" = { profile = "research", work_dir = "~/research-workspace" }
+
+# fb で作った PR を報告するチャンネル
+# [feedback]
+# report = "bot-feedback"

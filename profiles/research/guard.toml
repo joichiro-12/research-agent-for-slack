@@ -1,0 +1,93 @@
+# 研究チャンネルのガード（src/research_agent/guard.py が読む）。
+# Bash のコマンドの全文（ssh で送る中身も含む）を上から順に正規表現で調べ、最初に当たった規則で決める。
+#   deny    実行させない
+#   approve 利用者がスレッドで「承認」と返したときだけ、同じコマンドを 1 回実行させる
+# どれにも当たらなければ、そのまま実行される。止めたものは runtime/guard.log に残る。
+# cat・tee でファイルに書くだけのヒアドキュメントの本文は調べない（guard.py の strip_data_heredocs）。
+# ジョブスケジューラなど、自分の環境で止めたい操作の規則を足して使う。
+
+# ---- 実行させない ----
+
+[[rule]]
+name = "pattern-kill"
+action = "deny"
+pattern = '\b(pkill|killall)\b|\|\s*xargs\s+(-\S+\s+)*kill\b'
+reason = "名前やパターンでプロセスを止めると、同じ文字列を持つ自分のシェルや、ほかの人のプロセスに当たる。ps で番号を確かめ、kill <番号> で止める"
+
+[[rule]]
+name = "sudo"
+action = "deny"
+pattern = '\bsudo\b'
+reason = "管理者の権限は使わない"
+
+[[rule]]
+name = "secrets"
+action = "deny"
+pattern = '\.ssh/|\.claude/\.credentials|config/\.env(?![\w.])|\.git-credentials|\.netrc\b|\.config/gh\b'
+reason = "鍵や認証情報のファイルには触らない"
+
+# git が裏で呼ぶ認証はコマンドの文字列に出ないので、ここでは止まらない
+[[rule]]
+name = "gh-auth"
+action = "deny"
+pattern = '(?<![\w.-])gh\s+auth\s+(?!status\b)|(?<![\w.-])gh\s+auth\s+status\b[^;&|\n]*\s(-t\b|--show-token\b)|\bgit\b[^;&|\n]*\scredential\s+(fill|approve|reject)\b'
+reason = "GitHub のトークンを表示したり、入れ替えたりしない"
+
+[[rule]]
+name = "force-push"
+action = "deny"
+pattern = '\bgit\b[^;&|\n]*\bpush\b[^;&|\n]*(\s-f\b|--force)'
+reason = "履歴を書き換える push はしない"
+
+# ---- 承認を待つ ----
+
+[[rule]]
+name = "tmux"
+action = "approve"
+pattern = '\btmux\b[^;&|\n]*\b(new|new-session|new-window|kill-session|kill-server|kill-window|kill-pane|send-keys|respawn-pane)\b'
+reason = "tmux での常駐プロセスの起動・停止"
+
+[[rule]]
+name = "background"
+action = "approve"
+pattern = '\b(nohup|setsid|disown)\b|\bscreen\s+-\S*d'
+reason = "裏で動き続けるプロセスの起動"
+
+[[rule]]
+name = "gpu"
+action = "approve"
+pattern = 'CUDA_VISIBLE_DEVICES\s*=|\b(torchrun|deepspeed)\b|\baccelerate\s+launch\b|\bvllm\s+serve\b'
+reason = "GPU を使う実行。共用サーバーの GPU は、ほかの利用者も使っている"
+
+# 番号・$・- などが続く、実際に呼ぶ形だけを見る（grep の検索語や文章の kill では止めない）
+[[rule]]
+name = "kill"
+action = "approve"
+pattern = '\bkill\s+(\d|[^\s\w])|\bxargs\s+(-\S+\s+)*kill\b'
+reason = "プロセスの停止"
+
+# 届く先をトークンで絞ってあれば、作業枝への push は規則から外してもよい
+[[rule]]
+name = "push"
+action = "approve"
+pattern = '\bgit\b(?![^;&|\n]*\bstash\b)[^;&|\n]*\bpush\b'
+reason = "git push"
+
+# 読むだけの操作のほかは承認を待つ。知らないサブコマンドも止まるように、通す側を列挙する
+[[rule]]
+name = "gh"
+action = "approve"
+pattern = '(?<![\w.-])gh\s+(?!(api|auth|status|search|version|help|--version|--help|pr\s+(view|list|diff|checks|status|checkout)|repo\s+(view|list|clone)|run\s+(list|view)|issue\s+(view|list))(\s|$|[;&|)\x27"]))[a-z-]'
+reason = "gh での GitHub への書き込み（PR の作成、マージ、リポジトリの変更など）"
+
+[[rule]]
+name = "gh-api-write"
+action = "approve"
+pattern = '(?<![\w.-])gh\s+api\b[^;&|\n]*\s(-X|-[fF]|--method|--field|--raw-field|--input)'
+reason = "gh api での GitHub への書き込み"
+
+[[rule]]
+name = "recursive-delete"
+action = "approve"
+pattern = '\brm\s+(-\S*\s+)*-\S*[rR]|\brsync\b[^;&|\n]*--delete'
+reason = "ファイルの再帰的な削除"

@@ -1,0 +1,32 @@
+display_information:
+  name: research-agent
+  description: Claude Code に研究タスクを依頼する
+  background_color: "#2c2d30"
+features:
+  bot_user:
+    display_name: research-agent
+    always_online: true
+oauth_config:
+  scopes:
+    bot:
+      - app_mentions:read
+      - chat:write
+      - files:write
+      - files:read
+      - channels:history
+      - groups:history
+      # チャンネル名からプロファイルを選ぶため
+      - channels:read
+      - groups:read
+settings:
+  event_subscriptions:
+    bot_events:
+      - app_mention
+      # 一度メンションされたスレッドの、メンションなしの返信を受け取る
+      - message.channels
+      - message.groups
+  interactivity:
+    is_enabled: false
+  org_deploy_enabled: false
+  socket_mode_enabled: true
+  token_rotation_enabled: false

@@ -1,0 +1,13 @@
+# secrets
+config/.env
+
+# 実行時に生成されるもの（スレッドとセッションの対応表・ログ・Claude の作業場所）
+runtime/
+
+# python
+.venv/
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store

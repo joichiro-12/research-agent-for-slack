@@ -1,0 +1,13 @@
+{
+  "allow": [
+    "Bash",
+    "Edit",
+    "Write"
+  ],
+  "deny": [
+    "Edit(~/.ssh/**)",
+    "Edit(~/.claude/settings.json)",
+    "Edit(~/.claude/settings.local.json)",
+    "Edit(~/.claude/.credentials.json)"
+  ]
+}

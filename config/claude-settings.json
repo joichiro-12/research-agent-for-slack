@@ -1,0 +1,30 @@
+{
+  "permissions": {
+    "allow": [
+      "Read",
+      "Grep",
+      "Glob",
+      "Bash(ls *)",
+      "Bash(hostname)",
+      "Bash(nvidia-smi *)",
+      "Bash(df *)",
+      "WebSearch",
+      "WebFetch"
+    ],
+    "deny": [
+      "Read(~/.ssh/**)",
+      "Read(~/.claude/.credentials.json)",
+      "Read(~/.netrc)",
+      "Read(~/.git-credentials)",
+      "Read(~/.config/gh/**)",
+      "Read(~/.config/wandb/**)",
+      "Read(~/.cache/huggingface/token)",
+      "Read(~/.huggingface/**)",
+      "Read(~/.kaggle/**)",
+      "Read(~/.aws/**)",
+      "Read(~/.docker/config.json)",
+      "Read(~/.pypirc)",
+      "Read(//**/.env)"
+    ]
+  }
+}

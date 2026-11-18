@@ -95,21 +95,28 @@ def take_unposted(thread):
         return items
 
 
-def approve(thread):
-    """承認待ちをすべて承認済みにして、承認したものを返す。"""
+def _split(pending, ids):
+    """承認待ちを (答えるもの, 残すもの) に分ける。ids がなければ全部に答える。"""
+    if ids is None:
+        return pending, []
+    return [item for item in pending if item["id"] in ids], [item for item in pending if item["id"] not in ids]
+
+
+def approve(thread, ids=None):
+    """承認待ちを承認済みにして、承認したものを返す。ids を渡すと、その承認 ID のものだけ。"""
     with _state() as state:
         entry = _entry(state, thread)
-        items, entry["pending"] = entry["pending"], []
+        items, entry["pending"] = _split(entry["pending"], ids)
         until = time.time() + GRANT_TTL_SEC
         entry["granted"] += [{"hash": item["hash"], "until": until} for item in items]
         return items
 
 
-def withdraw(thread):
-    """承認待ちを取り下げて、取り下げたものを返す（却下されたときや、別の指示が来たとき）。"""
+def withdraw(thread, ids=None):
+    """承認待ちを取り下げて、取り下げたものを返す（却下されたときや、別の指示が来たとき）。ids を渡すと、その承認 ID のものだけ。"""
     with _state() as state:
         entry = _entry(state, thread)
-        items, entry["pending"] = entry["pending"], []
+        items, entry["pending"] = _split(entry["pending"], ids)
         return items
 
 

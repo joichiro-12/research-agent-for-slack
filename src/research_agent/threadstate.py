@@ -4,6 +4,7 @@
 - plan: 段取りのメッセージ（plan.py）
 - brief: スレッドの題と URL（bot.thread_brief）
 - turns: 受けたのに、まだ終わっていない依頼（順番待ちも含む）。bot が途中で止まるとここに残り、次の起動で続きをさせる（bot.resume_thread）
+- approval_messages: 答えを待っている承認の依頼のメッセージ（{"ts": メッセージ, "ids": 承認 ID}）。答えが出たら消す（bot.clear_approval_messages）
 """
 
 import json

@@ -1,4 +1,5 @@
-"""スレッドでターンが続くときの bot.py の配線と、スレッドの題（bot.thread_brief）を確かめる。
+"""スレッドでターンが続くときの bot.py の配線と、承認の依頼のメッセージ（ボタンと、答えが出たら消すこと）、
+スレッドの題（bot.thread_brief）を確かめる。
 
 Slack にはつながず、Claude と投稿を差し替えて確かめる。
 
@@ -115,8 +116,10 @@ class TurnsInAThreadTest(BotTestCase):
         self.assertTrue(text.endswith("いまは承認を待ってるよ"))
         first_ts = threadstate.get(self.KEY)["plan"]["ts"]
 
-        # 承認のターン。実験を動かして、前のターンの手順を完了にする
-        approvals.withdraw(self.KEY)
+        # 承認のターン。承認の依頼は、答えたときに消している（finish_approval）。実験を動かして、前のターンの手順を完了にする
+        self.bot.clear_approval_messages(self.client, "C1", self.KEY)
+        approvals.approve(self.KEY)
+        self.client.chat_delete.reset_mock()
         self.turn(*self.update("32", "completed"), prompt="【承認】")
         plan = threadstate.get(self.KEY)["plan"]
         self.assertIn("✅ 実験を動かす", plan["text"])
@@ -166,6 +169,171 @@ class TurnsInAThreadTest(BotTestCase):
         self.assertEqual(len(self.prompts), 2)
         self.assertEqual(self.posted[-1], "30 分の上限を 2 回使っても終わらなかったから、ここで止めたよ")
         self.assertEqual(json.loads((self.folder / "sessions.json").read_text())[self.KEY], "session-1")
+
+
+class ApprovalMessagesTest(BotTestCase):
+    """承認の依頼のメッセージ。ボタンか返信で答え、答えが出たら消す。"""
+
+    def setUp(self):
+        super().setUp()
+        self.client = mock.MagicMock()
+        self.client.chat_postMessage.side_effect = lambda **kwargs: {"ts": f"{200 + self.client.chat_postMessage.call_count}.1"}
+        patcher = mock.patch.object(self.bot, "handle_request")
+        self.handle = patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def ask(self, command="bash train.sh"):
+        approvals.request(self.KEY, command, "GPU を使う実行。詳しい説明")
+        self.bot.post_approval_requests(self.client, "C1", "100.1", self.KEY)
+
+    def reply(self, text):
+        event = {"channel": "C1", "ts": "300.1", "thread_ts": "100.1", "user": "test"}
+        with mock.patch.object(self.bot.feedback, "pending", return_value=None):
+            self.bot.route(self.client, event, text, "sonnet")
+
+    def deleted(self):
+        return [call.kwargs["ts"] for call in self.client.chat_delete.call_args_list]
+
+    def posted(self, index=-1):
+        return self.client.chat_postMessage.call_args_list[index].kwargs
+
+    def press(self, action, message_ts, thread_ts="100.1", user="test", ids=None):
+        """ボタンを押す。別スレッドで進める分は、その場で動かす。"""
+        blocks = self.client.chat_postMessage.call_args_list[int(float(message_ts)) - 201].kwargs["blocks"]
+        buttons = {button["action_id"]: button for button in blocks[-1]["elements"]}
+        body = {
+            "user": {"id": user},
+            "channel": {"id": "C1"},
+            "message": {"ts": message_ts, "thread_ts": thread_ts},
+            "actions": [{"action_id": action, "action_ts": "400.1", "value": ids or buttons[action]["value"]}],
+        }
+        with mock.patch.object(self.bot.threading, "Thread") as thread:
+            self.bot.answer_approval_button(self.client, body, action == self.bot.APPROVE_ACTION)
+        for call in thread.call_args_list:
+            call.kwargs["target"](*call.kwargs["args"])
+
+    def test_approving_deletes_the_request_and_runs_the_command(self):
+        self.ask()
+        self.reply("承認")
+        self.assertEqual(self.deleted(), ["201.1"])
+        self.assertTrue(self.handle.call_args.args[2].startswith("【承認】"))
+        self.assertTrue(approvals.consume(self.KEY, "bash train.sh"))
+        self.assertEqual(threadstate.get(self.KEY)["approval_messages"], [])
+
+    def test_rejecting_deletes_the_request(self):
+        self.ask()
+        self.reply("却下")
+        self.assertEqual(self.deleted(), ["201.1"])
+        self.assertTrue(self.handle.call_args.args[2].startswith("【却下】"))
+
+    def test_another_instruction_deletes_the_request_it_withdrew(self):
+        self.ask()
+        self.reply("先にログを見て")
+        self.assertEqual(self.deleted(), ["201.1"])
+        self.assertFalse(approvals.pending(self.KEY))
+
+    def test_a_long_request_split_into_messages_is_deleted_whole(self):
+        for i in range(4):
+            approvals.request(self.KEY, f"bash {i}.sh " + "x" * 1400, "GPU を使う実行")
+        self.bot.post_approval_requests(self.client, "C1", "100.1", self.KEY)
+        self.assertGreater(self.client.chat_postMessage.call_count, 1)
+        self.reply("承認")
+        self.assertEqual(len(self.deleted()), self.client.chat_postMessage.call_count)
+
+    def test_requests_from_two_turns_are_both_deleted(self):
+        self.ask("bash a.sh")
+        self.ask("bash b.sh")
+        self.reply("承認")
+        self.assertEqual(self.deleted(), ["201.1", "202.1"])
+
+    def test_a_failed_delete_does_not_stop_the_approval(self):
+        self.ask()
+        self.client.chat_delete.side_effect = RuntimeError("message_not_found")
+        self.reply("承認")
+        self.assertTrue(self.handle.call_args.args[2].startswith("【承認】"))
+        self.assertEqual(threadstate.get(self.KEY)["approval_messages"], [])
+
+    def test_a_reply_without_a_request_deletes_nothing(self):
+        self.reply("ありがとう")
+        self.client.chat_delete.assert_not_called()
+
+    def test_the_request_carries_buttons_instead_of_the_instruction(self):
+        self.ask()
+        kwargs = self.posted()
+        self.assertNotIn("返信してね", kwargs["text"])
+        self.assertIn("🔐 承認待ち：GPU を使う実行", kwargs["text"])
+        markdown, actions = kwargs["blocks"]
+        self.assertEqual(markdown["type"], "markdown")
+        approve, reject = actions["elements"]
+        item = approvals.pending(self.KEY)[0]
+        self.assertEqual((approve["action_id"], approve["value"]), (self.bot.APPROVE_ACTION, item["id"]))
+        self.assertEqual((reject["action_id"], reject["value"]), (self.bot.REJECT_ACTION, item["id"]))
+        # 承認だけ、触っただけで走らないよう確認を挟む
+        self.assertIn("confirm", approve)
+        self.assertNotIn("confirm", reject)
+
+    def test_only_the_last_message_of_a_long_request_has_buttons(self):
+        for i in range(4):
+            approvals.request(self.KEY, f"bash {i}.sh " + "x" * 1400, "GPU を使う実行")
+        self.bot.post_approval_requests(self.client, "C1", "100.1", self.KEY)
+        calls = self.client.chat_postMessage.call_args_list
+        self.assertGreater(len(calls), 1)
+        self.assertEqual([len(call.kwargs["blocks"]) for call in calls], [1] * (len(calls) - 1) + [2])
+
+    def test_approve_button_works_like_a_reply(self):
+        self.ask()
+        self.press(self.bot.APPROVE_ACTION, "201.1")
+        self.assertEqual(self.deleted(), ["201.1"])
+        self.assertTrue(self.handle.call_args.args[2].startswith("【承認】"))
+        self.assertEqual(self.handle.call_args.args[1], {"channel": "C1", "ts": "400.1", "thread_ts": "100.1", "user": "test"})
+        self.assertTrue(approvals.consume(self.KEY, "bash train.sh"))
+
+    def test_reject_button_runs_nothing(self):
+        self.ask()
+        self.press(self.bot.REJECT_ACTION, "201.1")
+        self.assertEqual(self.deleted(), ["201.1"])
+        self.assertTrue(self.handle.call_args.args[2].startswith("【却下】"))
+        self.assertFalse(approvals.consume(self.KEY, "bash train.sh"))
+
+    def test_a_button_answers_only_its_own_message(self):
+        # 古いメッセージのボタンで、あとから出た依頼まで承認してしまわない
+        self.ask("bash a.sh")
+        self.ask("bash b.sh")
+        self.press(self.bot.APPROVE_ACTION, "201.1")
+        self.assertEqual(self.deleted(), ["201.1"])
+        self.assertIn("bash a.sh", self.handle.call_args.args[2])
+        self.assertNotIn("bash b.sh", self.handle.call_args.args[2])
+        self.assertEqual([item["command"] for item in approvals.pending(self.KEY)], ["bash b.sh"])
+        self.assertFalse(approvals.consume(self.KEY, "bash b.sh"))
+        # 残った依頼は、返信の「承認」でも答えられる
+        self.reply("承認")
+        self.assertEqual(self.deleted(), ["201.1", "202.1"])
+        self.assertTrue(approvals.consume(self.KEY, "bash b.sh"))
+
+    def test_pressing_twice_runs_once(self):
+        self.ask()
+        self.press(self.bot.APPROVE_ACTION, "201.1")
+        self.press(self.bot.APPROVE_ACTION, "201.1")
+        self.handle.assert_called_once()
+        self.press(self.bot.REJECT_ACTION, "201.1")
+        self.handle.assert_called_once()
+
+    def test_other_people_cannot_press(self):
+        self.ask()
+        self.press(self.bot.APPROVE_ACTION, "201.1", user="U9")
+        self.handle.assert_not_called()
+        self.client.chat_delete.assert_not_called()
+        self.assertTrue(approvals.pending(self.KEY))
+
+    def test_a_button_in_the_thread_root_uses_its_own_ts(self):
+        self.ask()
+        body = {
+            "user": {"id": "test"}, "channel": {"id": "C1"}, "message": {"ts": "100.1"},
+            "actions": [{"action_ts": "400.1", "value": approvals.pending(self.KEY)[0]["id"]}],
+        }
+        with mock.patch.object(self.bot.threading, "Thread") as thread:
+            self.bot.answer_approval_button(self.client, body, True)
+        self.assertEqual(thread.call_args.kwargs["args"][1]["thread_ts"], "100.1")
 
 
 class ThreadBriefTest(BotTestCase):

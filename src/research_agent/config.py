@@ -33,6 +33,8 @@ SETTINGS_FILE = Path(os.environ.get("CLAUDE_SETTINGS", CONFIG_DIR / "claude-sett
 CLAUDE_MD_EXCLUDES = [str(ROOT_DIR / "CLAUDE.md"), str(ROOT_DIR / ".claude" / "CLAUDE.md")]
 # Slack トークンなど .env の中身は claude に引き継がない（echo $SLACK_BOT_TOKEN で読めてしまうため）
 CLAUDE_ENV = {k: v for k, v in os.environ.items() if k not in dotenv_values(ENV_FILE)}
+# Claude が Bash から使う bot のコマンド（agent-approval）を PATH に入れる
+CLAUDE_ENV["PATH"] = f"{ROOT_DIR / 'bin'}:{CLAUDE_ENV.get('PATH', '')}"
 # claude.ai のコネクタが接続し終わるまで待ってから始める。
 # 待たないと、セッションを再開したときにコネクタのツールが「切断された」と扱われて使えなくなる
 CLAUDE_ENV["MCP_CONNECTION_NONBLOCKING"] = "0"

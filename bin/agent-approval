@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# ガードが止めたコマンドの承認の依頼を取り下げる（research_agent.approvals）。bot が claude を動かすとき、このディレクトリを PATH に入れる
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+exec "$ROOT/.venv/bin/python" -m research_agent.approvals "$@"

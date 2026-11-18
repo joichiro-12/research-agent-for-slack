@@ -3,12 +3,18 @@
 実行: uv run python -m unittest discover -s tests
 """
 
+import json
+import os
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
-from research_agent import guard
+from research_agent import approvals, guard
 
-RULES = guard.load_rules(Path(__file__).resolve().parents[1] / "profiles/research/guard.toml")
+ROOT = Path(__file__).resolve().parents[1]
+RULES = guard.load_rules(ROOT / "profiles/research/guard.toml")
 DELETE = "recursive-delete"
 
 
@@ -355,6 +361,68 @@ class PushRuleTest(unittest.TestCase):
     def test_stash_push_passes(self):
         self.assertIsNone(rule_name("git stash push -m x"))
         self.assertIsNone(rule_name("ssh server 'git stash push -m x'"))
+
+
+class WithdrawTest(unittest.TestCase):
+    """ガードが止めた操作をせずに済ませるとき、Claude が承認の依頼を取り下げる（bin/agent-approval）。"""
+
+    THREAD = "C1:100.1"
+
+    def setUp(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.folder = Path(folder.name)
+        for attr, path in (("RUNTIME_DIR", self.folder), ("STATE_FILE", self.folder / "approvals.json"),
+                           ("LOCK_FILE", self.folder / "approvals.lock"), ("LOG_FILE", self.folder / "guard.log")):
+            patcher = mock.patch.object(approvals, attr, path)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def block(self, command):
+        """ガードに止めさせて、承認 ID と Claude への返事を返す。"""
+        verdict, _, reason = guard.decide(command, RULES, self.THREAD)
+        self.assertEqual(verdict, "pending")
+        return approvals.pending(self.THREAD)[-1]["id"], reason
+
+    def run_cli(self, *args, thread=THREAD):
+        """bot が動かす Claude の Bash と同じく、別のプロセスで動かす。"""
+        env = {**os.environ, "AGENT_THREAD": thread, "AGENT_RUNTIME": str(self.folder)}
+        return subprocess.run([ROOT / "bin/agent-approval", *args], env=env, capture_output=True, text=True, timeout=60)
+
+    def test_the_guard_tells_how_to_withdraw(self):
+        request_id, reason = self.block("rm -rf /tmp/work")
+        self.assertIn(f"`agent-approval --withdraw {request_id}`", reason)
+        self.assertIsNone(rule_name(f"agent-approval --withdraw {request_id}"))
+
+    def test_only_the_withdrawn_request_stops_waiting(self):
+        # 作業用に広げたファイルを消そうとして止まり、消さずに済ませたとき
+        request_id, _ = self.block("rm -rf /tmp/work && mkdir /tmp/work")
+        kept, _ = self.block("tmux new -d -s train 'bash train.sh'")
+        done = self.run_cli("--withdraw", request_id)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn(f"取り下げた: {request_id}", done.stdout)
+        self.assertEqual([item["id"] for item in approvals.take_unposted(self.THREAD)], [kept])
+        record = json.loads((self.folder / "guard.log").read_text().splitlines()[-1])
+        self.assertEqual((record["verdict"], record["id"]), ("withdrawn", request_id))
+
+    def test_unknown_ids_and_other_threads_fail(self):
+        theirs = approvals.request("C1:999.1", "bash other.sh", "GPU を使う実行")
+        done = self.run_cli("--withdraw", theirs, "ffffff")
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn(f"このスレッドの承認待ちにない: {theirs} ffffff", done.stderr)
+        self.assertEqual(len(approvals.pending("C1:999.1")), 1)
+
+    def test_claude_cannot_approve(self):
+        request_id, _ = self.block("tmux new -d -s train 'bash train.sh'")
+        self.assertNotEqual(self.run_cli("--approve", request_id).returncode, 0)
+        self.assertFalse(approvals.consume(self.THREAD, "tmux new -d -s train 'bash train.sh'"))
+        self.assertEqual(len(approvals.pending(self.THREAD)), 1)
+
+    def test_needs_the_thread(self):
+        request_id, _ = self.block("tmux new -d -s train 'bash train.sh'")
+        done = self.run_cli("--withdraw", request_id, thread="")
+        self.assertIn("AGENT_THREAD がない", done.stderr)
+        self.assertEqual(len(approvals.pending(self.THREAD)), 1)
 
 
 if __name__ == "__main__":

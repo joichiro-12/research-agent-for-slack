@@ -2,6 +2,7 @@
 
 先頭に fb を付けた依頼は、bot 自身の設定（profiles/）を直すフィードバックとして feedback.py で扱う。
 ガードが止めた操作は、依頼のメッセージのボタンか、スレッドへの「承認」の返信で実行させる（approvals.py）。答えが出たら、依頼のメッセージは消す。
+Claude がその操作をせずに済ませて取り下げた依頼は、スレッドに出さない（出していたら消す）。
 Claude が作業場の outbox に置いたファイルは、返信のあとにスレッドへ添付する（workspace.py）。
 1 つのスレッドでターンが続いても、段取りは引き継ぐ（plan.py）。
 bot の再起動で止まったターンは、次の起動でスレッドに知らせて、同じセッションで 1 回だけ続けさせる（resume_thread）。
@@ -307,11 +308,21 @@ def approval_buttons(ids):
 
 
 def post_approval_requests(client, channel, thread_ts, key):
-    """ガードが承認待ちに積んだ操作を、ボタンを付けてスレッドに出す。
+    """ガードが承認待ちに積んだ操作を、ボタンを付けてスレッドに出す。ターンの終わりに呼ぶ。
 
+    Claude が取り下げた操作（agent-approval）は出さない。前に出した依頼を取り下げていたら、そのメッセージを消し、
+    同じメッセージで待っていた残りは、新しいものと一緒に出し直す。
     理由は Claude 向けの説明が続くので、1 文目からカッコ書きを除いて見せる。コマンドは、承認すると走るものなので削らない。
     """
-    if not (items := approvals.take_unposted(key)):
+    # 利用者が答えたときは、メッセージを消してから承認待ちを外す（finish_approval）。承認待ちを先に読んでおけば、
+    # 答えが出たばかりのものを取り下げと取り違えない
+    pending = {item["id"]: item for item in approvals.pending(key)}
+    requests = threadstate.get(key).get("approval_messages", [])
+    withdrawn = {i for request in requests for i in request["ids"] if i not in pending}
+    again = [pending[i] for request in requests if withdrawn & set(request["ids"]) for i in request["ids"] if i in pending]
+    if withdrawn:
+        clear_approval_messages(client, channel, key, withdrawn)
+    if not (items := again + approvals.take_unposted(key)):
         return
     lines = [
         f"🔐 承認待ち：{re.sub(r'（[^）]*）', '', item['reason'].split('。')[0])}\n```\n{item['command'][:1500]}\n```"
@@ -323,7 +334,7 @@ def post_approval_requests(client, channel, thread_ts, key):
 
 
 def clear_approval_messages(client, channel, key, ids=None):
-    """答えが出た承認の依頼のメッセージを消す。スマホで読むときに邪魔になるため。ids を渡すと、その承認 ID のメッセージだけ。
+    """答えが出たか、取り下げた承認の依頼のメッセージを消す。スマホで読むときに邪魔になるため。ids を渡すと、その承認 ID のメッセージだけ。
 
     Claude はこのメッセージを読んでいない（コマンドはガードの返事と【承認】の依頼で受け取る）ので、消しても文脈は変わらない。
     何を承認したかは guard.log に残る。

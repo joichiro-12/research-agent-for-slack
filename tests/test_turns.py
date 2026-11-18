@@ -148,6 +148,19 @@ class TurnsInAThreadTest(BotTestCase):
         self.client.chat_postMessage.assert_not_called()
         self.assertEqual(threadstate.get(self.KEY)["plan"], before)
 
+    def test_a_request_withdrawn_in_the_turn_is_not_shown(self):
+        # 作業用に広げたファイルを消そうとして止まり、消さずに済ませたターン。承認の案内を出さない
+        def blocked_then_withdrawn():
+            request_id = approvals.request(self.KEY, "rm -rf /tmp/work && mkdir /tmp/work", "ファイルの再帰的な削除")
+            approvals.withdraw(self.KEY, [request_id])
+
+        self.turn(*self.create("1", "ノートを直す"), *self.update("1", "in_progress"), blocked_then_withdrawn)
+        texts = [call.kwargs.get("text", "") for call in self.client.chat_postMessage.call_args_list]
+        self.assertFalse([text for text in texts if "承認待ち" in text])
+        plan = threadstate.get(self.KEY)["plan"]["text"]
+        self.assertNotIn("🔐", plan)
+        self.assertTrue(plan.endswith("いまは返事を待ってるよ"))
+
     def test_a_timeout_continues_once_in_the_same_session(self):
         attempts = []
 
@@ -256,6 +269,45 @@ class ApprovalMessagesTest(BotTestCase):
     def test_a_reply_without_a_request_deletes_nothing(self):
         self.reply("ありがとう")
         self.client.chat_delete.assert_not_called()
+
+    def test_a_request_withdrawn_before_the_turn_ends_is_not_posted(self):
+        request_id = approvals.request(self.KEY, "rm -rf /tmp/work", "ファイルの再帰的な削除")
+        approvals.withdraw(self.KEY, [request_id])
+        self.bot.post_approval_requests(self.client, "C1", "100.1", self.KEY)
+        self.client.chat_postMessage.assert_not_called()
+
+    def test_a_posted_request_withdrawn_in_a_later_turn_is_deleted(self):
+        self.ask()
+        approvals.withdraw(self.KEY, [approvals.pending(self.KEY)[0]["id"]])
+        self.bot.post_approval_requests(self.client, "C1", "100.1", self.KEY)
+        self.assertEqual(self.deleted(), ["201.1"])
+        self.assertEqual(self.client.chat_postMessage.call_count, 1)
+        self.assertEqual(threadstate.get(self.KEY)["approval_messages"], [])
+
+    def test_the_rest_of_a_partly_withdrawn_request_is_posted_again(self):
+        approvals.request(self.KEY, "bash a.sh", "GPU を使う実行")
+        approvals.request(self.KEY, "bash b.sh", "GPU を使う実行")
+        self.bot.post_approval_requests(self.client, "C1", "100.1", self.KEY)
+        withdrawn = approvals.pending(self.KEY)[0]
+        approvals.withdraw(self.KEY, [withdrawn["id"]])
+        approvals.request(self.KEY, "bash c.sh", "GPU を使う実行")
+        self.bot.post_approval_requests(self.client, "C1", "100.1", self.KEY)
+        self.assertEqual(self.deleted(), ["201.1"])
+        text = self.posted()["text"]
+        self.assertNotIn("bash a.sh", text)
+        self.assertIn("bash b.sh", text)
+        self.assertIn("bash c.sh", text)
+        self.press(self.bot.APPROVE_ACTION, "202.1")
+        prompt = self.handle.call_args.args[2]
+        self.assertIn("bash b.sh", prompt)
+        self.assertIn("bash c.sh", prompt)
+        self.assertNotIn("bash a.sh", prompt)
+
+    def test_requests_still_waiting_stay_where_they_are(self):
+        self.ask()
+        self.bot.post_approval_requests(self.client, "C1", "100.1", self.KEY)
+        self.client.chat_delete.assert_not_called()
+        self.assertEqual(self.client.chat_postMessage.call_count, 1)
 
     def test_the_request_carries_buttons_instead_of_the_instruction(self):
         self.ask()

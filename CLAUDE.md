@@ -9,6 +9,7 @@ research-agent-for-slack/
 ├── src/research_agent/  # bot 本体（入口は bot.py、claude -p の実行は claude.py）
 ├── profiles/            # 指示と権限（persona.md + <プロファイル>/）。fb の PR が書き換える
 ├── config/              # channels.toml（チャンネル ↔ プロファイル・作業場・モデル）、claude-settings.json（共通の権限）
+├── bin/                 # Claude が Bash から使うコマンド（bot が PATH に入れる）
 ├── scripts/run.sh       # bot を常駐させる
 ├── tests/               # unittest
 └── runtime/             # 状態・ログ・作業場（git 管理外）

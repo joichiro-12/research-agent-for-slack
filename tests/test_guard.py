@@ -310,6 +310,41 @@ class GhRuleTest(unittest.TestCase):
         self.assertIsNone(rule_name("git config --get-all credential.helper"))
 
 
+class PublicDemoRuleTest(unittest.TestCase):
+    """デモは手元か tailnet の中だけに出す。インターネットに公開する呼び出しは止める。"""
+
+    def assertRule(self, name, commands):
+        for command in commands:
+            with self.subTest(command=command):
+                self.assertEqual(rule_name(command), name)
+
+    def test_tailnet_serve_and_port_forwarding_pass(self):
+        self.assertRule(None, (
+            "tailscale serve --bg --https=8443 http://127.0.0.1:7860",
+            "ssh gpu1 'tailscale serve status'",
+            "tailscale serve --https=8443 off",
+            "ssh -N -L 7860:localhost:7860 gpu1",
+        ))
+
+    def test_words_in_text_pass(self):
+        self.assertRule(None, (
+            "grep -n funnel docs/setup.md",
+            "which cloudflared",
+            "grep -rn ngrok notes",
+        ))
+
+    def test_public_urls_are_denied(self):
+        self.assertRule("public-demo", (
+            "tailscale funnel 3000",
+            "ssh gpu1 'tailscale funnel --bg --https=443 http://127.0.0.1:7860'",
+            "tailscale --socket=/tmp/tailscaled.sock funnel 7860",
+            "cloudflared tunnel --url http://127.0.0.1:7860",
+            "./cloudflared-linux-amd64 tunnel --url http://localhost:7860",
+            "ngrok http 7860",
+        ))
+        self.assertEqual(guard.decide("tailscale funnel --bg 7860", RULES, "C0:1")[0], "deny")
+
+
 class PushRuleTest(unittest.TestCase):
     """git push は行き先によらず承認を待ち、履歴を書き換えるものは止める。"""
 

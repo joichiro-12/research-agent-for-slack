@@ -3,6 +3,7 @@
 先頭に fb を付けた依頼は、bot 自身の設定（profiles/）を直すフィードバックとして feedback.py で扱う。
 ガードが止めた操作は、依頼のメッセージのボタンか、スレッドへの「承認」の返信で実行させる（approvals.py）。答えが出たら、依頼のメッセージは消す。
 Claude がその操作をせずに済ませて取り下げた依頼は、スレッドに出さない（出していたら消す）。
+スレッドの前の投稿で Claude に届いていないもの（bot を呼ぶ前に書いた文や、まだ渡していない添付）も、依頼に添えて渡す（attachments.py）。
 Claude が作業場の outbox に置いたファイルは、返信のあとにスレッドへ添付する（workspace.py）。
 1 つのスレッドでターンが続いても、段取りは引き継ぐ（plan.py）。
 bot の再起動で止まったターンは、次の起動でスレッドに知らせて、同じセッションで 1 回だけ続けさせる（resume_thread）。
@@ -430,6 +431,12 @@ def handle_request(client, event, prompt, model, effort=None, feedback_mode=Fals
         profile = replace(profile, effort=effort)
     if saved := attachments.download(event):
         prompt = "\n\n".join([prompt or "（本文なし。添付ファイルを確認して）", attachments.describe(saved)])
+    # スレッドの前の投稿で Claude に届いていないものを渡す。セッションがまだなければ、bot を呼ぶ前に書いた文も全部。
+    # フィードバックは別のセッションなので、次のターンに回す。再起動の続きでは、元の依頼の記録に入っている
+    if not feedback_mode and event.get("thread_ts"):
+        new_session = not resumed and not sessions.get(key)
+        if found := attachments.earlier(client, channel, thread_ts, ts, new_session):
+            prompt += "\n\n" + attachments.describe_earlier(found)
     outbox = None
     if feedback_mode:
         profile = feedback.profile(profile)

@@ -1,7 +1,9 @@
 """Slack の入口。メンションとスレッド内の返信を受け、claude の結果を同じスレッドに返す。
 
 先頭に fb を付けた依頼は、bot 自身の設定（profiles/）を直すフィードバックとして feedback.py で扱う。
-ガードが止めた操作は、スレッドで「承認」と返すと実行させる（approvals.py）。
+ガードが止めた操作は、依頼のメッセージのボタンか、スレッドへの「承認」の返信で実行させる（approvals.py）。答えが出たら、依頼のメッセージは消す。
+Claude がその操作をせずに済ませて取り下げた依頼は、スレッドに出さない（出していたら消す）。
+スレッドの前の投稿で Claude に届いていないもの（bot を呼ぶ前に書いた文や、まだ渡していない添付）も、依頼に添えて渡す（attachments.py）。
 Claude が作業場の outbox に置いたファイルは、返信のあとにスレッドへ添付する（workspace.py）。
 1 つのスレッドでターンが続いても、段取りは引き継ぐ（plan.py）。
 bot の再起動で止まったターンは、次の起動でスレッドに知らせて、同じセッションで 1 回だけ続けさせる（resume_thread）。
@@ -14,6 +16,7 @@ import threading
 import time
 import unicodedata
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import replace
 
@@ -24,12 +27,14 @@ from . import approvals, attachments, feedback, profiles, sessions, threadstate,
 from .claude import run_claude, stop_leftovers
 from .config import (
     ALLOWED_USER_IDS,
+    APPROVE_ACTION,
     APPROVE_PATTERN,
     CANCEL_PATTERN,
     DEFAULT_MODEL,
     DIFF_MAX_LEN,
     EFFORT_PATTERN,
     FEEDBACK_PATTERN,
+    LISTENER_WORKERS,
     MAX_ATTACHMENT_BYTES,
     MAX_UPLOADS,
     MODELS,
@@ -38,6 +43,7 @@ from .config import (
     OUTBOX_HINT,
     PLAN_ENV,
     PLAN_HINT,
+    REJECT_ACTION,
     REJECT_PATTERN,
     RESTART_GIVE_UP,
     RESTART_NOTICE,
@@ -63,7 +69,7 @@ from .status import StatusReporter
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger(__name__)
 
-app = App(token=SLACK_BOT_TOKEN)
+app = App(token=SLACK_BOT_TOKEN, listener_executor=ThreadPoolExecutor(max_workers=LISTENER_WORKERS))
 thread_locks = defaultdict(threading.Lock)
 seen_events = set()
 
@@ -82,22 +88,32 @@ def pick_effort(prompt):
     return None, prompt
 
 
-def post_reply(client, channel, thread_ts, text):
-    """thread_ts が None ならチャンネルに投稿する。最後に投稿したメッセージの ts を返す。"""
+def post_chunks(client, channel, thread_ts, text, last_blocks=()):
+    """長い文は分けて投稿し、投稿したメッセージの ts をすべて返す。thread_ts が None ならチャンネルに投稿する。
+
+    last_blocks は最後のメッセージに足すブロック（ボタンなど）。
+    """
+    posted = []
     chunks = [text[i : i + SLACK_CHUNK] for i in range(0, len(text), SLACK_CHUNK)] or [""]
-    for chunk in chunks:
+    for index, chunk in enumerate(chunks):
         try:
             # markdown ブロックなら Claude の Markdown をそのまま表示できる
             res = client.chat_postMessage(
                 channel=channel,
                 thread_ts=thread_ts,
                 text=chunk,
-                blocks=[{"type": "markdown", "text": chunk}],
+                blocks=[{"type": "markdown", "text": chunk}, *(last_blocks if index == len(chunks) - 1 else ())],
             )
         except Exception:
             log.exception("markdown block failed, falling back to plain text")
             res = client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=chunk)
-    return res["ts"]
+        posted.append(res["ts"])
+    return posted
+
+
+def post_reply(client, channel, thread_ts, text):
+    """thread_ts が None ならチャンネルに投稿する。最後に投稿したメッセージの ts を返す。"""
+    return post_chunks(client, channel, thread_ts, text)[-1]
 
 
 def accept(event):
@@ -168,6 +184,7 @@ def route(client, event, prompt, model, effort=None):
             return
         # 承認の返事でなければ、承認待ちは取り下げて、新しい指示として扱う
         approvals.withdraw(key)
+        clear_approval_messages(client, channel, key)
         prompt = f"（承認を求めた操作は、承認されないまま次の指示が来た。その操作は実行しないこと）\n{prompt}"
     if not (m := FEEDBACK_PATTERN.match(prompt)):
         handle_request(client, event, prompt, model, effort)
@@ -245,15 +262,21 @@ def finish_feedback(client, event, approve):
         report(client, f"PR #{pr['number']} に追加: {pr['summary']}\n[元のスレッド]({pr['permalink']}) ・ {pr['url']}")
 
 
-def finish_approval(client, event, model, effort, approve):
-    """承認待ちの操作を閉じ、結果を伝えて Claude に続きをさせる。承認なら、同じコマンドが 1 回だけ通るようになる。"""
+def finish_approval(client, event, model, effort, approve, ids=None):
+    """承認待ちの操作を閉じ、結果を伝えて Claude に続きをさせる。承認なら、同じコマンドが 1 回だけ通るようになる。
+
+    ids は答える承認 ID（ボタンは、押したメッセージの分だけ）。なければ、このスレッドの承認待ち全部（返信での答え）。
+    もう答えが出ていたら、何もしない（ボタンの 2 度押しなど）。
+    """
     key = sessions.thread_key(event["channel"], event.get("thread_ts") or event["ts"])
+    clear_approval_messages(client, event["channel"], key, ids)
     if not approve:
-        approvals.withdraw(key)
-        prompt = "【却下】承認を求めた操作は却下された。実行しないこと。ここまでの状況と、ほかに取れる手を短く返すこと。"
-        handle_request(client, event, prompt, model, effort)
+        if approvals.withdraw(key, ids):
+            prompt = "【却下】承認を求めた操作は却下された。実行しないこと。ここまでの状況と、ほかに取れる手を短く返すこと。"
+            handle_request(client, event, prompt, model, effort)
         return
-    items = approvals.approve(key)
+    if not (items := approvals.approve(key, ids)):
+        return
     waited = int((time.time() - min(item["at"] for item in items)) // 60)
     commands = "\n".join(f"```\n{item['command']}\n```" for item in items)
     prompt = (
@@ -264,19 +287,68 @@ def finish_approval(client, event, model, effort, approve):
     handle_request(client, event, prompt, model, effort)
 
 
-def post_approval_requests(client, channel, thread_ts, key):
-    """ガードが承認待ちに積んだ操作を、スレッドに出す。
+def approval_buttons(ids):
+    """承認の依頼に付けるボタン。押したメッセージの分だけに答えられるよう、value に承認 ID を入れる。
 
+    スマホで触っただけでコマンドが走らないよう、承認には確認を挟む。却下は何も実行しないので挟まない。
+    """
+    value = ",".join(ids)
+    confirm = {
+        "title": {"type": "plain_text", "text": "承認する？"},
+        "text": {"type": "plain_text", "text": "このコマンドを実行するよ"},
+        "confirm": {"type": "plain_text", "text": "実行する"},
+        "deny": {"type": "plain_text", "text": "戻る"},
+    }
+    return [{
+        "type": "actions",
+        "elements": [
+            {"type": "button", "action_id": APPROVE_ACTION, "text": {"type": "plain_text", "text": "承認"}, "style": "primary", "value": value, "confirm": confirm},
+            {"type": "button", "action_id": REJECT_ACTION, "text": {"type": "plain_text", "text": "却下"}, "value": value},
+        ],
+    }]
+
+
+def post_approval_requests(client, channel, thread_ts, key):
+    """ガードが承認待ちに積んだ操作を、ボタンを付けてスレッドに出す。ターンの終わりに呼ぶ。
+
+    Claude が取り下げた操作（agent-approval）は出さない。前に出した依頼を取り下げていたら、そのメッセージを消し、
+    同じメッセージで待っていた残りは、新しいものと一緒に出し直す。
     理由は Claude 向けの説明が続くので、1 文目からカッコ書きを除いて見せる。コマンドは、承認すると走るものなので削らない。
     """
-    if not (items := approvals.take_unposted(key)):
+    # 利用者が答えたときは、メッセージを消してから承認待ちを外す（finish_approval）。承認待ちを先に読んでおけば、
+    # 答えが出たばかりのものを取り下げと取り違えない
+    pending = {item["id"]: item for item in approvals.pending(key)}
+    requests = threadstate.get(key).get("approval_messages", [])
+    withdrawn = {i for request in requests for i in request["ids"] if i not in pending}
+    again = [pending[i] for request in requests if withdrawn & set(request["ids"]) for i in request["ids"] if i in pending]
+    if withdrawn:
+        clear_approval_messages(client, channel, key, withdrawn)
+    if not (items := again + approvals.take_unposted(key)):
         return
     lines = [
         f"🔐 承認待ち：{re.sub(r'（[^）]*）', '', item['reason'].split('。')[0])}\n```\n{item['command'][:1500]}\n```"
         for item in items
     ]
-    lines.append("「承認」か「却下」で返信してね")
-    post_reply(client, channel, thread_ts, "\n".join(lines))
+    ids = [item["id"] for item in items]
+    posted = post_chunks(client, channel, thread_ts, "\n".join(lines), approval_buttons(ids))
+    threadstate.update(key, approval_messages=threadstate.get(key).get("approval_messages", []) + [{"ts": posted, "ids": ids}])
+
+
+def clear_approval_messages(client, channel, key, ids=None):
+    """答えが出たか、取り下げた承認の依頼のメッセージを消す。スマホで読むときに邪魔になるため。ids を渡すと、その承認 ID のメッセージだけ。
+
+    Claude はこのメッセージを読んでいない（コマンドはガードの返事と【承認】の依頼で受け取る）ので、消しても文脈は変わらない。
+    何を承認したかは guard.log に残る。
+    """
+    requests = threadstate.get(key).get("approval_messages", [])
+    answered = [request for request in requests if ids is None or set(request["ids"]) & set(ids)]
+    for request in answered:
+        for ts in request["ts"]:
+            try:
+                client.chat_delete(channel=channel, ts=ts)
+            except Exception as e:
+                log.warning("could not delete the approval request %s: %s", ts, e)
+    threadstate.update(key, approval_messages=[request for request in requests if request not in answered])
 
 
 def upload_outbox(client, channel, thread_ts, outbox):
@@ -359,6 +431,12 @@ def handle_request(client, event, prompt, model, effort=None, feedback_mode=Fals
         profile = replace(profile, effort=effort)
     if saved := attachments.download(event):
         prompt = "\n\n".join([prompt or "（本文なし。添付ファイルを確認して）", attachments.describe(saved)])
+    # スレッドの前の投稿で Claude に届いていないものを渡す。セッションがまだなければ、bot を呼ぶ前に書いた文も全部。
+    # フィードバックは別のセッションなので、次のターンに回す。再起動の続きでは、元の依頼の記録に入っている
+    if not feedback_mode and event.get("thread_ts"):
+        new_session = not resumed and not sessions.get(key)
+        if found := attachments.earlier(client, channel, thread_ts, ts, new_session):
+            prompt += "\n\n" + attachments.describe_earlier(found)
     outbox = None
     if feedback_mode:
         profile = feedback.profile(profile)
@@ -470,6 +548,38 @@ def refresh_plan(key):
         log.exception("failed to refresh the plan of %s", key)
     finally:
         lock.release()
+
+
+def answer_approval_button(client, body, approve):
+    """承認・却下のボタンが押されたら、返信で答えたときと同じように進める。
+
+    許可していない人のボタンは無視する。Claude を動かすあいだ Slack を待たせないよう、別スレッドで進める。
+    """
+    user = body["user"]["id"]
+    if user not in ALLOWED_USER_IDS:
+        log.info("ignored an approval button from %s", user)
+        return
+    action, message = body["actions"][0], body["message"]
+    event = {
+        "channel": body["channel"]["id"],
+        "ts": action["action_ts"],
+        "thread_ts": message.get("thread_ts") or message["ts"],
+        "user": user,
+    }
+    args = (client, event, DEFAULT_MODEL, None, approve, action["value"].split(","))
+    threading.Thread(target=finish_approval, args=args, daemon=True).start()
+
+
+@app.action(APPROVE_ACTION)
+def on_approve_button(ack, body, client):
+    ack()
+    answer_approval_button(client, body, True)
+
+
+@app.action(REJECT_ACTION)
+def on_reject_button(ack, body, client):
+    ack()
+    answer_approval_button(client, body, False)
 
 
 @app.event("app_mention")

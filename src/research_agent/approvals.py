@@ -2,17 +2,20 @@
 
 ガード（guard.py。Claude Code のフックとして別プロセスで動く）と bot の両方が読み書きするので、
 ファイルロックをかけて扱う。スレッドごとに次の 2 つを持つ。
-- pending: 承認待ちのコマンド。ガードが積み、bot がスレッドで承認を求める
+- pending: 承認待ちのコマンド。ガードが積み、bot がスレッドで承認を求める。
+  その操作をせずに済ませるときは、Claude が agent-approval で取り下げる（取り下げたものは、bot がスレッドに出さない）
 - granted: 承認済みで、まだ実行していないコマンド。1 回実行すると消え、GRANT_TTL_SEC を過ぎても消える
 コマンドは全文の SHA-256 で照合する（承認したものと 1 文字でも違えば、承認し直しになる）。
 フックから bot の設定（.env）を読まずに使えるよう、標準ライブラリだけで書く。
 """
 
+import argparse
 import fcntl
 import hashlib
 import json
 import os
 import secrets
+import sys
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -95,21 +98,28 @@ def take_unposted(thread):
         return items
 
 
-def approve(thread):
-    """承認待ちをすべて承認済みにして、承認したものを返す。"""
+def _split(pending, ids):
+    """承認待ちを (答えるもの, 残すもの) に分ける。ids がなければ全部に答える。"""
+    if ids is None:
+        return pending, []
+    return [item for item in pending if item["id"] in ids], [item for item in pending if item["id"] not in ids]
+
+
+def approve(thread, ids=None):
+    """承認待ちを承認済みにして、承認したものを返す。ids を渡すと、その承認 ID のものだけ。"""
     with _state() as state:
         entry = _entry(state, thread)
-        items, entry["pending"] = entry["pending"], []
+        items, entry["pending"] = _split(entry["pending"], ids)
         until = time.time() + GRANT_TTL_SEC
         entry["granted"] += [{"hash": item["hash"], "until": until} for item in items]
         return items
 
 
-def withdraw(thread):
-    """承認待ちを取り下げて、取り下げたものを返す（却下されたときや、別の指示が来たとき）。"""
+def withdraw(thread, ids=None):
+    """承認待ちを取り下げて、取り下げたものを返す（却下されたときや、別の指示が来たとき）。ids を渡すと、その承認 ID のものだけ。"""
     with _state() as state:
         entry = _entry(state, thread)
-        items, entry["pending"] = entry["pending"], []
+        items, entry["pending"] = _split(entry["pending"], ids)
         return items
 
 
@@ -118,3 +128,24 @@ def log(record):
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
     with open(LOG_FILE, "a") as f:
         f.write(json.dumps({"time": time.strftime("%Y-%m-%d %H:%M:%S"), **record}, ensure_ascii=False) + "\n")
+
+
+def main():
+    """agent-approval: 承認の依頼を Claude が取り下げる。承認はできない（答えるのは Slack の利用者だけ）。"""
+    parser = argparse.ArgumentParser(prog="agent-approval", description="ガードが止めたコマンドの承認の依頼を取り下げる")
+    parser.add_argument("--withdraw", nargs="+", required=True, metavar="ID", help="取り下げる承認 ID（ガードの返事にある）")
+    args = parser.parse_args()
+    thread = os.environ.get("AGENT_THREAD")
+    if not thread:
+        sys.exit("agent-approval は bot から動かした Claude の中でだけ使える（AGENT_THREAD がない）")
+    items = withdraw(thread, args.withdraw)
+    for item in items:
+        log({"thread": thread, "verdict": "withdrawn", "id": item["id"], "command": item["command"][:2000]})
+    if items:
+        print(f"取り下げた: {' '.join(item['id'] for item in items)}。承認の案内はスレッドに出さない（出していたら、このターンの終わりに消す）")
+    if missing := [i for i in args.withdraw if i not in {item["id"] for item in items}]:
+        sys.exit(f"このスレッドの承認待ちにない: {' '.join(missing)}")
+
+
+if __name__ == "__main__":
+    main()

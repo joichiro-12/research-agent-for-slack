@@ -39,6 +39,13 @@ action = "deny"
 pattern = '\bgit\b[^;&|\n]*\bpush\b[^;&|\n]*(\s-f\b|--force)'
 reason = "履歴を書き換える push はしない"
 
+# 誰でも開ける URL を作る呼び出しだけを見る。tailnet の中だけに出す tailscale serve は通す
+[[rule]]
+name = "public-demo"
+action = "deny"
+pattern = '(?<![\w.-])tailscale\s+(--socket[=\s]\S+\s+)?funnel\b|(?<![\w.-])(cloudflared|ngrok)[\w.-]*\s+(tunnel|http|tcp|start)\b'
+reason = "デモをインターネットに公開しない。認証のないデモは URL を知った誰からでも使え、API の鍵を使うものならその料金もかかる。手元から見るなら、ssh のポート転送か、tailnet の中だけに出す tailscale serve を使う"
+
 # ---- 承認を待つ ----
 
 [[rule]]

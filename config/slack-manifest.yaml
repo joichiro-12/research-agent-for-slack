@@ -25,8 +25,9 @@ settings:
       # 一度メンションされたスレッドの、メンションなしの返信を受け取る
       - message.channels
       - message.groups
+  # 承認・却下のボタン。Socket Mode なので Request URL は要らない
   interactivity:
-    is_enabled: false
+    is_enabled: true
   org_deploy_enabled: false
   socket_mode_enabled: true
   token_rotation_enabled: false

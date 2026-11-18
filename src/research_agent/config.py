@@ -33,6 +33,8 @@ SETTINGS_FILE = Path(os.environ.get("CLAUDE_SETTINGS", CONFIG_DIR / "claude-sett
 CLAUDE_MD_EXCLUDES = [str(ROOT_DIR / "CLAUDE.md"), str(ROOT_DIR / ".claude" / "CLAUDE.md")]
 # Slack トークンなど .env の中身は claude に引き継がない（echo $SLACK_BOT_TOKEN で読めてしまうため）
 CLAUDE_ENV = {k: v for k, v in os.environ.items() if k not in dotenv_values(ENV_FILE)}
+# Claude が Bash から使う bot のコマンド（agent-approval）を PATH に入れる
+CLAUDE_ENV["PATH"] = f"{ROOT_DIR / 'bin'}:{CLAUDE_ENV.get('PATH', '')}"
 # claude.ai のコネクタが接続し終わるまで待ってから始める。
 # 待たないと、セッションを再開したときにコネクタのツールが「切断された」と扱われて使えなくなる
 CLAUDE_ENV["MCP_CONNECTION_NONBLOCKING"] = "0"
@@ -83,6 +85,12 @@ APPROVE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 REJECT_PATTERN = re.compile(r"^(却下|やめる|やめて|やめます|キャンセル|中止|いいえ|no|cancel)[\s!。.]*$", re.IGNORECASE)
+# 承認の依頼に付けるボタン（bot.approval_buttons）
+APPROVE_ACTION = "approval_approve"
+REJECT_ACTION = "approval_reject"
+# Bolt がリスナーを動かすスレッドの数。既定の 5 本では、メンションの処理がターンのあいだ 1 本ずつ使うので、
+# 埋まるとボタンに 3 秒以内に返せなくなる。ターンは claude を待っているだけなので、多くても負荷にならない
+LISTENER_WORKERS = 32
 
 # Claude が作業場の outbox/<スレッド>/ に置いたファイルを、返信のあとにスレッドへ添付する（1 回の依頼で最大 MAX_UPLOADS 件）
 MAX_UPLOADS = 10

@@ -1,4 +1,4 @@
-"""段取りのメッセージ（plan.py）。ターンをまたいで更新し、いま待っていることを添える。
+"""段取りのメッセージ（plan.py）。ターンをまたいで更新し、いま待っていることを添え、手順が全部終わったら消す。
 
 実行: uv run python -m unittest discover -s tests
 """
@@ -154,13 +154,35 @@ class AcrossTurnsTest(PlanTestCase):
         self.assertIn("⬜ 測り直す", self.slack.last)
         self.assertIn("✅ 調べる", self.slack.last)
 
-    def test_a_finished_plan_stays_and_the_next_plan_starts_anew(self):
+    def test_a_finished_plan_is_removed_and_the_next_plan_starts_anew(self):
         self.turn(*created("1", "調べる"), *updated("1", "completed"))
-        old = self.slack.last
+        self.assertEqual(self.slack.messages, {})
         self.turn(*created("2", "次を調べる"))
-        self.assertEqual(len(self.slack.messages), 2)
-        self.assertEqual(list(self.slack.messages.values())[0], old)
-        self.assertNotIn("✅ 調べる", self.slack.last)
+        self.assertEqual(len(self.slack.messages), 1)
+        self.assertEqual(self.slack.last, "*Steps*  ▱\n⬜ 次を調べる\n\nいまは返事を待ってるよ")
+
+    def test_the_last_step_removes_the_message_at_once(self):
+        # 終わった段取りは、返信を待たずにその場で消す
+        reporter = PlanReporter(self.slack, "C1", "100.1", KEY)
+        reporter.start()
+        for event in [*created("1", "調べる"), *created("2", "まとめる"), *updated("1", "completed")]:
+            reporter.on_event(event)
+        self.assertEqual(len(self.slack.messages), 1)
+        for event in updated("2", "completed"):
+            reporter.on_event(event)
+        self.assertEqual(self.slack.messages, {})
+        reporter.finish(False)
+        self.assertEqual(self.slack.messages, {})
+        self.assertIsNone(threadstate.get(KEY)["plan"]["ts"])
+        self.assertEqual(threadstate.get(KEY)["plan"]["tasks"], {})
+
+    def test_a_finished_plan_from_before_is_removed_on_the_next_change(self):
+        # この決まりより前に終わって、メッセージが残っている段取り
+        threadstate.update(KEY, plan={"ts": "150.1", "text": "*Steps*  ▰\n✅ 調べる", "session": SESSION, "tasks": {"1": {"subject": "調べる", "status": "completed"}}})
+        self.slack.messages["150.1"] = "*Steps*  ▰\n✅ 調べる"
+        PlanReporter(self.slack, "C1", "100.1", KEY).refresh(False)
+        self.assertEqual(self.slack.messages, {})
+        self.assertIsNone(threadstate.get(KEY)["plan"]["ts"])
 
     def test_a_new_session_starts_a_new_plan(self):
         # セッションが変わると、手順の ID は振り直される
@@ -212,9 +234,10 @@ class WaitingTest(PlanTestCase):
         self.turn(*created("1", "調べる"), *updated("1", "in_progress"))
         self.assertEqual(self.slack.last, "*Steps*  ▱\n⬜ 調べる\n\nいまは返事を待ってるよ")
 
-    def test_finished_steps_wait_for_nothing(self):
-        self.turn(*created("1", "調べる"), *updated("1", "completed"))
-        self.assertEqual(self.slack.last, "*Steps*  ▰\n✅ 調べる")
+    def test_finished_steps_leave_nothing_even_with_an_approval(self):
+        # 承認を待っていても、手順が全部終われば段取りは消す（承認の依頼は、そのメッセージで分かる）
+        self.turn(*created("1", "調べる"), *updated("1", "completed"), approval=True)
+        self.assertEqual(self.slack.messages, {})
 
     def test_no_plan_means_no_message(self):
         self.turn(approval=True)

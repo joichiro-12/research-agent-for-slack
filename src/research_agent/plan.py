@@ -2,7 +2,7 @@
 
 Claude のタスクはセッションの中で続くので、段取りも 1 回の実行ではなくスレッドに持つ（threadstate.py の plan）。
 - 手順が全部終わるまでは、ターンをまたいでも同じ段取りを更新する。新しい手順も同じ段取りに足す
-- 全部終わったあとに手順が登録されたら、新しいメッセージで次の段取りを始める
+- 手順が全部終わったら、メッセージを消す（終わった段取りは、スマホで読むときに邪魔になる）。そのあとに手順が登録されたら、新しいメッセージで次の段取りを始める
 - 前のターンから表示が変わったら、メッセージをスレッドの末尾に出し直す（古い位置を書き換えても目に入らないので、前のメッセージは消す）
 - ターンを終えるときは、何を待っているかを添える（承認、なくて手順が残っていれば返事）
 """
@@ -152,11 +152,12 @@ class PlanReporter:
         return "\n".join(lines)
 
     def _show(self, move=True):
-        # 手順がなくなったら、メッセージも消す
-        if not self.tasks:
+        # 手順が全部終わったか、なくなったら、メッセージを消す
+        if not _unfinished(self.tasks):
             if self._ts:
                 self._delete(self._ts)
-                self._ts, self._text = None, None
+            if self.tasks or self._ts:
+                self.tasks, self._ts, self._text, self._settled = {}, None, None, None
                 self._save()
             return
         text = self._render()

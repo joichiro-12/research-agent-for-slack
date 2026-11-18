@@ -131,11 +131,11 @@ class TurnsInAThreadTest(BotTestCase):
         self.assertEqual(self.resumes[-1], "session-1")
         self.assertEqual(self.posted, ["返答"])
 
-        # 残りの手順を終えるターン
+        # 残りの手順を終えるターン。手順が全部終わったら、段取りは消える
+        last_ts = plan["ts"]
         self.turn(*self.update("33", "in_progress"), *self.update("33", "completed"), prompt="結果を見て")
-        text = threadstate.get(self.KEY)["plan"]["text"]
-        self.assertIn("▰▰▰", text)
-        self.assertNotIn("待ってるよ", text)
+        self.assertIsNone(threadstate.get(self.KEY)["plan"]["ts"])
+        self.assertIn(mock.call(channel="C1", ts=last_ts), self.client.chat_delete.call_args_list)
 
     def test_a_question_between_steps_leaves_the_plan_where_it_is(self):
         self.turn(*self.create("1", "調べる"), *self.create("2", "まとめる"), *self.update("1", "completed"))
